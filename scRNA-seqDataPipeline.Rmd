@@ -10,56 +10,13 @@ date: "2024-11-23"
 output: html_document
 ---
 
-The goal of this document is to display the process in which single cell RNA seq data is analyzed, from fastq files to data visualization and differential gene expression. This document goes through quantification of counts using CellRanger, then displays the methods used in the Kaiser 2023 paper, "IL-7 receptor signaling drives human B-cell progenitor differentiation and expansion", and, finally, using scAdam to predict the cell types.
+The goal of this document is to display the process in which single cell RNA seq data is analyzed, data visualization and cell-type annotation and differential gene expression. We used scAdam to predict the cell types.
 
 scAdam is a novel, machine learning approach to cell type annotation that uses annotated scRNAseq data to accurately assign cell types to given data. It takes normalized scRNAseq data as inputs and provides an output of predicted cell types in three levels.
 
-# Reads Sequencing and Counts Matrix Generation
+# Load libraries and counts matrices
 
-To begin, we run CellRanger on the fastq files. CellRanger performs alignment, filtering, and barcode and UMI counting on single cell reads to generate a raw counts matrix. The single cell reads were aligned to the GRCh38-2024-A reference genome (downloaded from 10X Genomics).
-
-```{bash,eval=FALSE}
-
-#!/bin/bash
-
-# Define the path to CellRanger
-CELLRANGER_PATH="/data/lobolab/ReversePatterning.Reza/bin/bin/cell_ranger/cellranger-8.0.1/cellranger"
-
-# Define the path to the reference genome
-REF_GENOME="/data/lobolab/ReversePatterning.Reza/bin/bin/cell_ranger/refdata-gex-GRCh38-2024-A"
-
-# Define the directory for output data
-OUTPUT_DIR="/data/lobolab/ReversePatterning.Reza/cell_ranger_pipeline/Kaiser2023/Kaiser2023_Outputs_With_Chemistry_Force_Cells_9000"
-
-# Define the Samples Text that includes sample name and the path to its fastq folder
-SAMPLES_FILE="/data/lobolab/ReversePatterning.Reza/cell_ranger_pipeline/Kaiser2023/KaiserSamplesList.txt"
-
-# Define the number of cells to be forced to be detected
-FORCE_CELLS="9000"
-
-# Define the chemistry used
-CHEM="SC5P-R2"
-
-# Loop through samples text file and run CellRanger count
-while read -r SAMPLE_ID FASTQ_PATH; do
-
-# Change to output directory to ensure results go in the right container
-        cd $OUTPUT_DIR
-
-        $CELLRANGER_PATH count --id=$SAMPLE_ID\
-                --localcores=60\
-                --localmem=200\
-                --create-bam=false\
-                --transcriptome=$REF_GENOME\
-                --fastqs=$FASTQ_PATH\
-                --sample=$SAMPLE_ID\
-                --chemistry=$CHEM\
-                --force-cells=$FORCE_CELLS
-done < "$SAMPLES_FILE"
-
-```
-
-Once the counts matrices are generated for each sample, we move onto R. The necessary libraries for the analysis are loaded and the counts matrices are read into R.
+After generating counts matrices by Cell Ranger, the necessary libraries for the analysis are loaded and the counts matrices are read into R.
 
 ```{r,message=FALSE,warning=FALSE}
 
@@ -80,7 +37,7 @@ sc <- import("scanpy", convert = FALSE)
 scp <- import("scparadise", convert = FALSE)
 
 # Define home 
-home_dir <- "/data/lobolab/ReversePatterning.Reza/Kaiser2023/outputs/"
+home_dir <- "/data/lobolab/ReversePatterning.Reza/scRNA-seqData/outputs/"
 
 # Load the data for all samples
 sample_1 <- Read10X(data.dir = paste0(home_dir, "/Patient_1/"), gene.column = 2, cell.column = 1, unique.features = TRUE)
@@ -96,7 +53,7 @@ sample_4_GEX <- sample_4$`Gene Expression`
 
 ```
 
-# Preprocessing:
+# Preprocessing
 
 A separate Seurat object is then made for each sample. We filter out genes that are not expressed in at least three cells and cells that do not express at least 200 genes.
 
