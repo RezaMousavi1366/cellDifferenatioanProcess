@@ -1,0 +1,330 @@
+---
+title: "scRNA-seq data analysis"
+date: "2024-11-05"
+output: html_document
+---
+
+---
+title: "scRNA-seq data analysis"
+date: "2024-11-23"
+output: html_document
+---
+
+The goal of this document is to display the process in which single cell RNA seq data is analyzed, from fastq files to data visualization and differential gene expression. This document goes through quantification of counts using CellRanger, then displays the methods used in the Kaiser 2023 paper, "IL-7 receptor signaling drives human B-cell progenitor differentiation and expansion", and, finally, using scAdam to predict the cell types.
+
+scAdam is a novel, machine learning approach to cell type annotation that uses annotated scRNAseq data to accurately assign cell types to given data. It takes normalized scRNAseq data as inputs and provides an output of predicted cell types in three levels.
+
+# Reads Sequencing and Counts Matrix Generation
+
+To begin, we run CellRanger on the fastq files. CellRanger performs alignment, filtering, and barcode and UMI counting on single cell reads to generate a raw counts matrix. The single cell reads were aligned to the GRCh38-2024-A reference genome (downloaded from 10X Genomics).
+
+```{bash,eval=FALSE}
+
+#!/bin/bash
+
+# Define the path to CellRanger
+CELLRANGER_PATH="/data/lobolab/ReversePatterning.Reza/bin/bin/cell_ranger/cellranger-8.0.1/cellranger"
+
+# Define the path to the reference genome
+REF_GENOME="/data/lobolab/ReversePatterning.Reza/bin/bin/cell_ranger/refdata-gex-GRCh38-2024-A"
+
+# Define the directory for output data
+OUTPUT_DIR="/data/lobolab/ReversePatterning.Reza/cell_ranger_pipeline/Kaiser2023/Kaiser2023_Outputs_With_Chemistry_Force_Cells_9000"
+
+# Define the Samples Text that includes sample name and the path to its fastq folder
+SAMPLES_FILE="/data/lobolab/ReversePatterning.Reza/cell_ranger_pipeline/Kaiser2023/KaiserSamplesList.txt"
+
+# Define the number of cells to be forced to be detected
+FORCE_CELLS="9000"
+
+# Define the chemistry used
+CHEM="SC5P-R2"
+
+# Loop through samples text file and run CellRanger count
+while read -r SAMPLE_ID FASTQ_PATH; do
+
+# Change to output directory to ensure results go in the right container
+        cd $OUTPUT_DIR
+
+        $CELLRANGER_PATH count --id=$SAMPLE_ID\
+                --localcores=60\
+                --localmem=200\
+                --create-bam=false\
+                --transcriptome=$REF_GENOME\
+                --fastqs=$FASTQ_PATH\
+                --sample=$SAMPLE_ID\
+                --chemistry=$CHEM\
+                --force-cells=$FORCE_CELLS
+done < "$SAMPLES_FILE"
+
+```
+
+Once the counts matrices are generated for each sample, we move onto R. The necessary libraries for the analysis are loaded and the counts matrices are read into R.
+
+```{r,message=FALSE,warning=FALSE}
+
+# import R libraries
+library(Seurat)
+library(scDblFinder)
+library(sceasy)
+library(reticulate)
+library(glmGamPoi)
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+set.seed(0)
+
+# import Python libraries
+use_virtualenv(virtualenv = '~/Implementation/venv')
+sc <- import("scanpy", convert = FALSE)
+scp <- import("scparadise", convert = FALSE)
+
+# Define home 
+home_dir <- "/data/lobolab/ReversePatterning.Reza/Kaiser2023/outputs/"
+
+# Load the data for all samples
+sample_1 <- Read10X(data.dir = paste0(home_dir, "/Patient_1/"), gene.column = 2, cell.column = 1, unique.features = TRUE)
+sample_2 <- Read10X(data.dir = paste0(home_dir, "/Control_1/"), gene.column = 2, cell.column = 1, unique.features = TRUE)
+sample_3 <- Read10X(data.dir = paste0(home_dir, "/Patient_2/"), gene.column = 2, cell.column = 1, unique.features = TRUE)
+sample_4 <- Read10X(data.dir = paste0(home_dir, "/Control_2/"), gene.column = 2, cell.column = 1, unique.features = TRUE)
+
+# Extract gene expression data from samples
+sample_1_GEX <- sample_1$`Gene Expression`
+sample_2_GEX <- sample_2$`Gene Expression`
+sample_3_GEX <- sample_3$`Gene Expression`
+sample_4_GEX <- sample_4$`Gene Expression`
+
+```
+
+# Preprocessing:
+
+A separate Seurat object is then made for each sample. We filter out genes that are not expressed in at least three cells and cells that do not express at least 200 genes.
+
+Each sample is then preprocessed using scDblFinder to filter out any doublets found in each sample.
+
+```{r,message=FALSE,warning=FALSE}
+# Function to preprocess each sample
+process_sample <- function(counts, project_name) {
+  # Create Seurat object
+  object <- CreateSeuratObject(counts = counts, project = project_name, min.cells = 3, min.features = 200)
+  
+  # Add mitochondrial percentage information
+  object[["percent.mt"]] <- PercentageFeatureSet(object, pattern = "^MT-")
+  
+  # Convert to SingleCellExperiment format for scDblFinder
+  sce <- as.SingleCellExperiment(object)
+  
+  # Run doublet detection
+  sce <- scDblFinder(sce,verbose = FALSE)
+  
+  # Add scDblFinder results back to Seurat object
+  object$scDblFinder.class <- sce$scDblFinder.class
+  object$scDblFinder.score <- sce$scDblFinder.score
+  
+  # Filter out doublets (if necessary)
+  object <- subset(object, scDblFinder.class == "singlet")
+  
+  # Return the processed Seurat object
+  return(object)
+}
+
+# Preprocess all samples
+patient_1 <- process_sample(sample_1_GEX, "patient_1")
+control_1 <- process_sample(sample_2_GEX, "control_1")
+patient_2 <- process_sample(sample_3_GEX, "patient_2")
+control_2 <- process_sample(sample_4_GEX, "control_2")
+
+```
+
+The Seurat objects are then merged, and the original identity of each sample is maintained.
+
+```{r,message=FALSE,warning=FALSE}
+# Merge all samples into one Seurat object
+object <- merge(patient_1, y = c(control_1, patient_2, control_2), 
+                add.cell.ids = c("patient_1", "control_1", "patient_2", "control_2"),
+                project = "combined_project")
+```
+
+# Filtration
+
+Mitochondrial data is then determined, and filtration is performed to retain cells that have between 200-5000 genes, less than 20,000 genes, and less than 25% mitochondrial content.
+
+```{r,message=FALSE,warning=FALSE}
+# Visualize number of genes, counts, percent of mito genes in cells
+object[["percent.mt"]] <- PercentageFeatureSet(object, pattern = "^MT-")
+
+VlnPlot(
+  object,
+  features = c("nFeature_RNA", 
+               "nCount_RNA", 
+               "percent.mt"),
+  ncol = 3,
+  group.by = 'scDblFinder.class'
+)
+
+## Subset low quality cells
+object <-
+  subset(object, subset = 
+           nFeature_RNA > 200 &
+           nFeature_RNA < 5000 & 
+           nCount_RNA < 20000 & 
+           percent.mt < 25)
+object <-
+  subset(object, scDblFinder.class == 'singlet')
+```
+
+# Normalization
+
+We then move on to normalizing the data. The Seurat object is first split based on its original identity. SCTransform is then performed on each individual object.
+
+It is important to split the objects so that median library sizes are more similar. If done on the combined Seurat object, there may be greater differences in library sizes (perhaps due to biological differences). Per sample normalization decreases this.
+
+```{r,message=FALSE,warning=FALSE}
+
+# Split the data
+total.list <- SplitObject(object, split.by = "orig.ident")
+
+total.list <- lapply(X = total.list, FUN = function(x){
+  x <- SCTransform(x, n_genes = 3000,vst.flavor='v2',vars.to.regress='percent.mt',verbose=FALSE)
+  
+})
+
+```
+
+# Integration
+
+The samples must be merged again. To do so, we integrate each sample together by: finding integration features, subsetting the samples to selected features, finding integration anchors based on the features, and finally integrating the data.
+
+Integration of the data uses the anchors to remove technical variabilities (or batch effects) between the samples.
+
+```{r, warning=FALSE, message=FALSE}
+
+features <- SelectIntegrationFeatures(object.list = total.list, nfeatures = 3000,normalization.method= "SCT",verbose = FALSE)
+
+filter_genes <- function(total) {
+  total <- subset(total, features = features)
+  return(total)
+}
+
+filtered_total_list <- lapply(total.list, filter_genes)
+
+prepped.list <- PrepSCTIntegration(filtered_total_list,anchor.features = features)
+
+# Perform Integration
+anchors <- FindIntegrationAnchors(object.list = prepped.list,anchor.features = features, normalization.method = "SCT",verbose = FALSE)
+total.combined <- IntegrateData(anchorset = anchors,normalization.method = "SCT",verbose=FALSE)
+
+# Perform Integrated Analysis
+DefaultAssay(total.combined) <- "integrated"
+
+```
+
+# Dimensional Reduction and UMAP Mapping
+
+Dimensional reduction by PCA and UMAP embedding is performed using 30 pcs.
+
+```{r, warning=FALSE,message=FALSE}
+
+# Standard workflow
+total.combined <- RunPCA(total.combined, npcs = 30, verbose=FALSE)
+total.combined <- RunUMAP(total.combined, dims = 1:30, verbose=FALSE)
+```
+
+# Loading scAdam and Associated Datasets
+
+Seurat object is then prepared for compatibility with scAdam by converting it to an 'anndata' format.
+
+```{r,message=FALSE,warning=FALSE}
+
+## Conversion of Seurat object to AnnData and prediction using scAdam model
+# Convert Seurat object (R) to AnnData (Python)
+adata <- convertFormat(total.combined, assay = 'SCT', from="seurat", to="anndata", main_layer="counts", drop_single_values=FALSE)
+adata <- adata$copy()
+
+# Normalizing to median total counts
+sc$pp$normalize_total(adata, target_sum = NULL) #, target_sum = FALSE)
+# Logarithmize the data
+sc$pp$log1p(adata)
+# Set the .raw attribute of the AnnData object 
+# to the normalized and logarithmized gene expression 
+# for later use by scparadise
+adata$raw <- adata
+
+```
+
+# Predicting Cell Types through scAdam
+
+BMMC dataset was used to train scAdam to predict the cell types.
+
+```{r,message=FALSE,warning=FALSE}
+
+
+# Download dataframe with available models 
+df <- scp$scadam$available_models()
+
+# Download scAdam model
+scp$scadam$download_model(model_name = 'Human_BMMC', save_path = '')
+
+# Predict cell types using scAdam model
+scp$scadam$predict(adata, path_model = 'Human_BMMC_scAdam')
+
+# Add AnnData.obs to Seurat object meta.data
+meta <- py_to_r(adata$obs)
+total.combined@meta.data <- meta
+
+```
+
+# Data Visualization of Predictions
+
+Predicted cell types are then visualized on UMAPs.
+
+```{r,warning=FALSE,message=FALSE,fig.dim=c(14,10)}
+# Use pallete to generate clearer colors
+cols_vect <- c(brewer.pal(12, "Set3"), brewer.pal(9, "Pastel1"), brewer.pal(9, "Set1"))
+
+## Visualize predictions on UMAP
+# Celltype_l1
+DimPlot(total.combined,
+        group.by = c('pred_celltype_l1'),
+        pt.size = 1,
+        label = T,
+        label.size = 6, 
+        repel = T,
+        cols=cols_vect) + theme(axis.title.x = element_text(size = 20),
+                                axis.title.y = element_text(size = 20),
+                                axis.text.x = element_text(size = 20),
+                                axis.text.y = element_text(size=20))
+
+
+# Celltype_l2
+DimPlot(total.combined,
+      group.by = c('pred_celltype_l2'),
+      pt.size = 1,
+      label = T,
+      label.size = 6,
+      repel = T,
+      cols=cols_vect) + theme(axis.title.x = element_text(size = 20),
+                                axis.title.y = element_text(size = 20),
+                                axis.text.x = element_text(size = 20),
+                                axis.text.y = element_text(size=20))
+
+# Celltype_l3
+DimPlot(total.combined,
+        group.by = c('pred_celltype_l3'),
+        pt.size = 1,
+        label = T,
+        label.size = 6, 
+        #cols = colorspace::qualitative_hcl(n = 16, l = 55, l1 = 55, c1 = 200),
+        repel = T,
+        cols=cols_vect) + theme(axis.title.x = element_text(size = 20),
+                                axis.title.y = element_text(size = 20),
+                                axis.text.x = element_text(size = 20),
+                                axis.text.y = element_text(size=20))
+
+```
+
+
+## Sesion Info
+```{r session-info}
+sessionInfo()
+```
